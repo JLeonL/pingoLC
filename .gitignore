@@ -1,0 +1,17 @@
+.appdata/
+.dotnet/
+.dotnet_cli/
+.nuget/
+bin/
+obj/
+unity/Library/
+unity/Logs/
+unity/Temp/
+unity/UserSettings/
+*.log
+UnityHubSetup-x64.exe
+UnitySetup64-*.exe
+dotnet-install.ps1
+extracted-luigi/
+extracted-luigi-source/
+luigi.zip
