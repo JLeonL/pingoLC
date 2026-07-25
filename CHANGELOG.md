@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1
+
+- Registers Pingo as a Netcode network prefab on host and clients before joining a lobby.
+- Fixes Pingo only being visible for the host in multiplayer sessions.
+
 ## 1.0.0
 
 - First public release.

@@ -21,13 +21,14 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
 {
     public const string PluginGuid = "JLeonL.PingoEnemy";
     public const string PluginName = "Pingo Enemy";
-    public const string PluginVersion = "1.0.0";
+    public const string PluginVersion = "1.0.1";
 
     internal static ManualLogSource Log = null!;
     internal static PingoEnemyPlugin Instance = null!;
     internal static AssetBundle? Bundle;
     internal static AudioClip? PingoClip;
     internal static EnemyType? RegisteredEnemyType;
+    internal static GameObject? RegisteredEnemyPrefab;
     internal static Texture2D? LuigiBodyTexture;
     internal static Texture2D? LuigiBodyNormalTexture;
     internal static Texture2D? LuigiEyeTexture;
@@ -214,6 +215,7 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
 
         EnsureEnemyComponents(prefab);
         prefab.name = "Pingo";
+        RegisteredEnemyPrefab = prefab;
 
         var enemyType = ScriptableObject.CreateInstance<EnemyType>();
         enemyType.name = "Pingo";
@@ -242,6 +244,47 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
 
         RegisteredEnemyType = enemyType;
         Enemies.RegisterEnemy(enemyType, Mathf.Max(0, spawnWeight.Value), Levels.LevelTypes.All, terminalNode, terminalKeyword);
+        TryRegisterNetworkPrefab("RegisterEnemy");
+    }
+
+    internal static void TryRegisterNetworkPrefab(string reason)
+    {
+        if (RegisteredEnemyPrefab == null)
+        {
+            Log.LogWarning($"Cannot register Pingo network prefab for {reason}: prefab is null.");
+            return;
+        }
+
+        var networkObject = RegisteredEnemyPrefab.GetComponent<NetworkObject>();
+        if (networkObject == null)
+        {
+            Log.LogWarning($"Cannot register Pingo network prefab for {reason}: prefab has no NetworkObject.");
+            return;
+        }
+
+        if (NetworkManager.Singleton == null)
+        {
+            Log.LogInfo($"Deferred Pingo network prefab registration for {reason}: NetworkManager.Singleton is null.");
+            return;
+        }
+
+        try
+        {
+            NetworkManager.Singleton.AddNetworkPrefab(RegisteredEnemyPrefab);
+            Log.LogInfo($"Registered Pingo network prefab with Netcode for {reason}. prefab={RegisteredEnemyPrefab.name}; networkObject={networkObject != null}");
+        }
+        catch (Exception ex)
+        {
+            var message = ex.Message ?? string.Empty;
+            if (message.IndexOf("already", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                message.IndexOf("duplicate", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                Log.LogInfo($"Pingo network prefab was already registered for {reason}.");
+                return;
+            }
+
+            Log.LogWarning($"Could not register Pingo network prefab for {reason}: {ex}");
+        }
     }
 
     internal static bool SpawnPingoNearLocalPlayer(string reason)
@@ -947,5 +990,16 @@ internal static class StartOfRoundPatches
     {
         PingoEnemyPlugin.Log.LogInfo("StartOfRound.OnShipLandedMiscEvents fired; checking forced Pingo spawn.");
         PingoEnemyPlugin.TryForceSpawnAfterLanding("OnShipLandedMiscEvents");
+    }
+}
+
+[HarmonyPatch(typeof(GameNetworkManager))]
+internal static class GameNetworkManagerPatches
+{
+    [HarmonyPostfix]
+    [HarmonyPatch("Start")]
+    private static void StartPostfix()
+    {
+        PingoEnemyPlugin.TryRegisterNetworkPrefab("GameNetworkManager.Start");
     }
 }
