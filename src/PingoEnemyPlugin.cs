@@ -21,7 +21,7 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
 {
     public const string PluginGuid = "JLeonL.PingoEnemy";
     public const string PluginName = "Pingo Enemy";
-    public const string PluginVersion = "1.0.1";
+    public const string PluginVersion = "1.0.2";
 
     internal static ManualLogSource Log = null!;
     internal static PingoEnemyPlugin Instance = null!;
@@ -777,9 +777,14 @@ public sealed class PingoEnemyAI : EnemyAI
         base.Update();
         StopMoving();
 
-        if (!IsOwner || source == null || PingoEnemyPlugin.PingoClip == null)
+        if (source == null || PingoEnemyPlugin.PingoClip == null)
         {
             return;
+        }
+
+        if (source.clip == null)
+        {
+            source.clip = PingoEnemyPlugin.PingoClip;
         }
 
         aliveForSeconds += Time.deltaTime;
@@ -816,7 +821,7 @@ public sealed class PingoEnemyAI : EnemyAI
         }
 
         nextNoiseAt = Time.time + interval;
-        PlayPingoClientRpc(Mathf.Clamp01(1f - interval / BaseInterval), CalculateNearVolumeScale(), interval, nearPlayerSeconds);
+        PlayPingoLocal(Mathf.Clamp01(1f - interval / BaseInterval), CalculateNearVolumeScale(), interval, nearPlayerSeconds);
         if (resetOverlapRampAfterPlay)
         {
             accumulatedIntervalReduction = 0f;
@@ -830,8 +835,7 @@ public sealed class PingoEnemyAI : EnemyAI
         // Pingo is intentionally harmless and effectively indestructible.
     }
 
-    [ClientRpc]
-    private void PlayPingoClientRpc(float intensity, float volumeScale, float nextInterval, float nearbySeconds)
+    private void PlayPingoLocal(float intensity, float volumeScale, float nextInterval, float nearbySeconds)
     {
         if (source == null || PingoEnemyPlugin.PingoClip == null)
         {

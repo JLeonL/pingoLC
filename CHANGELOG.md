@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2
+
+- Plays Pingo's audio locally on every client so non-host players can hear it in multiplayer.
+- Keeps the synchronized enemy spawn from 1.0.1 while avoiding audio-only host ownership.
+
 ## 1.0.1
 
 - Registers Pingo as a Netcode network prefab on host and clients before joining a lobby.
