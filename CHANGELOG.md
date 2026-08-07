@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.0
+
+- Adds movement for Pingo using the indoor NavMesh.
+- Pingo now patrols interior rooms, looks for visible players, and chases a selected target.
+- After the sound overlap loop resets, Pingo gives the chased player a 30 second cooldown before targeting them again.
+- Keeps Pingo as a harmless enemy and prevents it from acting as an outside enemy.
+- Adds NetworkTransform support so movement is synchronized for multiplayer clients.
+
 ## 1.0.2
 
 - Plays Pingo's audio locally on every client so non-host players can hear it in multiplayer.

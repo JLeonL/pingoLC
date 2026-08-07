@@ -25,6 +25,10 @@
       <HintPath>$(LCGameDir)\Lethal Company_Data\Managed\Unity.Netcode.Runtime.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="Unity.Netcode.Components">
+      <HintPath>$(LCGameDir)\Lethal Company_Data\Managed\Unity.Netcode.Components.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="UnityEngine">
       <HintPath>$(LCGameDir)\Lethal Company_Data\Managed\UnityEngine.dll</HintPath>
       <Private>false</Private>

@@ -4,7 +4,7 @@ schemaVersion = "0.0.1"
 [package]
 namespace = "Ctb_Eivissa"
 name = "PingoEnemy"
-versionNumber = "1.0.2"
+versionNumber = "2.0.0"
 description = "A harmless stationary Lethal Company enemy that gets noisier over time, especially when watched or shared in the same room."
 websiteUrl = "https://github.com/JLeonL/pingoLC"
 containsNsfwContent = false

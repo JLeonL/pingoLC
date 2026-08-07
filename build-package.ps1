@@ -28,6 +28,9 @@ $env:APPDATA = Join-Path $root ".appdata\Roaming"
 $env:LOCALAPPDATA = Join-Path $root ".appdata\Local"
 
 & $dotnet build $project -c $Configuration --configfile (Join-Path $root "NuGet.Config")
+if ($LASTEXITCODE -ne 0) {
+    throw "dotnet build failed with exit code $LASTEXITCODE"
+}
 
 if (!(Test-Path -LiteralPath $dll)) {
     throw "Missing compiled DLL: $dll"

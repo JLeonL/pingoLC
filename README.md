@@ -4,11 +4,13 @@ Pingo adds a new indoor enemy to Lethal Company.
 
 Developed by JLeonL.
 
-Pingo is harmless: it does not chase, move, or kill players. It stands still, can be scanned as an enemy, and becomes increasingly annoying as players stay near it.
+Pingo is harmless: it does not kill players. It patrols indoor rooms, chases visible players, can be scanned as an enemy, and becomes increasingly annoying as players stay near it.
 
 ## Features
 
-- Stationary non-lethal enemy.
+- Non-lethal indoor enemy.
+- Patrols interior rooms and chases visible players.
+- Gives a chased player a 30 second targeting cooldown after the sound loop resets.
 - Scannable as `Pingo`.
 - High spawn weight by default.
 - Spatial `pingo.mp3` audio.
@@ -51,3 +53,4 @@ Required dependencies:
 ## Notes
 
 All players in the lobby should install the mod and dependencies.
+Everyone should use the same version, especially for 2.0.0+ because movement is network synchronized.

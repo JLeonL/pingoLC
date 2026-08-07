@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using BepInEx;
 using BepInEx.Configuration;
@@ -8,6 +9,7 @@ using GameNetcodeStuff;
 using HarmonyLib;
 using LethalLib.Modules;
 using Unity.Netcode;
+using Unity.Netcode.Components;
 using UnityEngine;
 using UnityEngine.AI;
 using UnityEngine.InputSystem;
@@ -21,7 +23,7 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
 {
     public const string PluginGuid = "JLeonL.PingoEnemy";
     public const string PluginName = "Pingo Enemy";
-    public const string PluginVersion = "1.0.2";
+    public const string PluginVersion = "2.0.0";
 
     internal static ManualLogSource Log = null!;
     internal static PingoEnemyPlugin Instance = null!;
@@ -234,7 +236,7 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
 
         var terminalNode = ScriptableObject.CreateInstance<TerminalNode>();
         terminalNode.creatureName = "Pingo";
-        terminalNode.displayText = "Pingo\n\nNo mata, no persigue y no se mueve. Solo se queda en la sala haciendo ruido con cada vez mas insistencia.\n";
+        terminalNode.displayText = "Pingo\n\nNo mata, pero ahora patrulla el interior y persigue a los jugadores que ve mientras hace ruido cada vez con mas insistencia.\n";
         terminalNode.clearPreviousText = true;
         terminalNode.maxCharactersToType = 2000;
 
@@ -375,15 +377,18 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
             prefab.AddComponent<NetworkObject>();
         }
 
+        var networkTransform = prefab.GetComponent<NetworkTransform>() ?? prefab.AddComponent<NetworkTransform>();
+        networkTransform.Interpolate = true;
+
         var ai = prefab.GetComponent<PingoEnemyAI>() ?? prefab.AddComponent<PingoEnemyAI>();
         ai.enemyType = null;
 
         var agent = prefab.GetComponent<NavMeshAgent>() ?? prefab.AddComponent<NavMeshAgent>();
-        agent.speed = 0f;
-        agent.angularSpeed = 0f;
-        agent.acceleration = 0f;
-        agent.stoppingDistance = 0f;
-        agent.updatePosition = false;
+        agent.speed = 2.2f;
+        agent.angularSpeed = 360f;
+        agent.acceleration = 10f;
+        agent.stoppingDistance = 1.4f;
+        agent.updatePosition = true;
         agent.updateRotation = false;
 
         var source = prefab.GetComponent<AudioSource>() ?? prefab.AddComponent<AudioSource>();
@@ -451,6 +456,16 @@ public sealed class PingoEnemyAI : EnemyAI
     private const float IntervalReductionPerNearPlay = 0.1f;
     private const float OverlapMinimumInterval = 0.1f;
     private const int MinimumIntervalPlaysBeforeReset = 30;
+    private const float WanderSpeed = 1.6f;
+    private const float ChaseSpeed = 3.2f;
+    private const float RotationSpeed = 8f;
+    private const float TargetScanInterval = 0.5f;
+    private const float ChasePathRefreshInterval = 0.2f;
+    private const float WanderRefreshInterval = 4f;
+    private const float TargetCooldownSeconds = 30f;
+    private const float VisionRange = 45f;
+    private const float VisionDotThreshold = 0.15f;
+    private const float LoseTargetDistance = 70f;
 
     private AudioSource? source;
     private float nextNoiseAt;
@@ -458,6 +473,12 @@ public sealed class PingoEnemyAI : EnemyAI
     private float nearPlayerSeconds;
     private float accumulatedIntervalReduction;
     private int minimumIntervalPlayCount;
+    private PlayerControllerB? currentPursuitTarget;
+    private readonly Dictionary<ulong, float> targetCooldownUntil = new();
+    private float nextTargetScanAt;
+    private float nextChasePathRefreshAt;
+    private float nextWanderRefreshAt;
+    private Vector3 lastPosition;
 
     public override void Start()
     {
@@ -475,6 +496,12 @@ public sealed class PingoEnemyAI : EnemyAI
         EnsureRuntimeScanNode();
         movingTowardsTargetPlayer = false;
         nextNoiseAt = Time.time + 3f;
+        nextTargetScanAt = Time.time;
+        nextWanderRefreshAt = Time.time;
+        lastPosition = transform.position;
+        ConfigureAgentForMovement(WanderSpeed);
+        SetEnemyOutside(false);
+        isOutside = false;
         EnsureVisibleFallbackBody();
         ApplyLuigiMaterials();
         PingoEnemyPlugin.Log.LogInfo($"PingoEnemyAI started at {transform.position}; hasAudio={PingoEnemyPlugin.PingoClip != null}; isOwner={IsOwner}.");
@@ -769,13 +796,21 @@ public sealed class PingoEnemyAI : EnemyAI
     public override void DoAIInterval()
     {
         base.DoAIInterval();
-        StopMoving();
+        if (IsServer)
+        {
+            UpdateServerMovement(forceDecision: true);
+        }
     }
 
     public override void Update()
     {
         base.Update();
-        StopMoving();
+        if (IsServer)
+        {
+            UpdateServerMovement(forceDecision: false);
+        }
+
+        RotateTowardsMovement();
 
         if (source == null || PingoEnemyPlugin.PingoClip == null)
         {
@@ -824,6 +859,11 @@ public sealed class PingoEnemyAI : EnemyAI
         PlayPingoLocal(Mathf.Clamp01(1f - interval / BaseInterval), CalculateNearVolumeScale(), interval, nearPlayerSeconds);
         if (resetOverlapRampAfterPlay)
         {
+            if (IsServer)
+            {
+                FinishPursuitCycle();
+            }
+
             accumulatedIntervalReduction = 0f;
             minimumIntervalPlayCount = 0;
             PingoEnemyPlugin.Log.LogInfo("Pingo overlap loop played 30 times at minimum interval; resetting interval ramp.");
@@ -965,16 +1005,233 @@ public sealed class PingoEnemyAI : EnemyAI
         return Vector3.Dot(playerCamera.transform.forward, toPingo) > 0.75f;
     }
 
-    private void StopMoving()
+    private void UpdateServerMovement(bool forceDecision)
+    {
+        SetEnemyOutside(false);
+        isOutside = false;
+
+        if (currentPursuitTarget != null && !IsValidTarget(currentPursuitTarget, requireVisible: false))
+        {
+            ClearPursuitTarget("target became invalid");
+        }
+
+        if (currentPursuitTarget == null && (forceDecision || Time.time >= nextTargetScanAt))
+        {
+            nextTargetScanAt = Time.time + TargetScanInterval;
+            var visibleTarget = FindVisibleTarget();
+            if (visibleTarget != null)
+            {
+                BeginPursuit(visibleTarget);
+            }
+        }
+
+        if (currentPursuitTarget != null)
+        {
+            ChaseCurrentTarget();
+            return;
+        }
+
+        WanderInsideFactory(forceDecision);
+    }
+
+    private void BeginPursuit(PlayerControllerB player)
+    {
+        currentPursuitTarget = player;
+        targetPlayer = player;
+        movingTowardsTargetPlayer = true;
+        SetMovingTowardsTargetPlayer(player);
+        ConfigureAgentForMovement(ChaseSpeed);
+        nextChasePathRefreshAt = 0f;
+        PingoEnemyPlugin.Log.LogInfo($"Pingo started chasing player {player.playerClientId}.");
+    }
+
+    private void ChaseCurrentTarget()
+    {
+        if (currentPursuitTarget == null || agent == null)
+        {
+            return;
+        }
+
+        ConfigureAgentForMovement(ChaseSpeed);
+        if (Time.time < nextChasePathRefreshAt)
+        {
+            return;
+        }
+
+        nextChasePathRefreshAt = Time.time + ChasePathRefreshInterval;
+        if (Vector3.Distance(transform.position, currentPursuitTarget.transform.position) > LoseTargetDistance)
+        {
+            ClearPursuitTarget("target too far away");
+            return;
+        }
+
+        if (!SetDestinationToPosition(currentPursuitTarget.transform.position, true))
+        {
+            ClearPursuitTarget("no valid path to target");
+        }
+    }
+
+    private void FinishPursuitCycle()
+    {
+        if (currentPursuitTarget != null)
+        {
+            targetCooldownUntil[currentPursuitTarget.playerClientId] = Time.time + TargetCooldownSeconds;
+            PingoEnemyPlugin.Log.LogInfo($"Pingo finished chase cycle for player {currentPursuitTarget.playerClientId}; cooldown={TargetCooldownSeconds:0}s.");
+        }
+
+        ClearPursuitTarget("sound loop reset");
+        nextTargetScanAt = Time.time;
+        nextWanderRefreshAt = Time.time;
+    }
+
+    private void ClearPursuitTarget(string reason)
+    {
+        if (currentPursuitTarget != null)
+        {
+            PingoEnemyPlugin.Log.LogInfo($"Pingo stopped chasing player {currentPursuitTarget.playerClientId}: {reason}.");
+        }
+
+        currentPursuitTarget = null;
+        targetPlayer = null;
+        movingTowardsTargetPlayer = false;
+        ConfigureAgentForMovement(WanderSpeed);
+    }
+
+    private PlayerControllerB? FindVisibleTarget()
+    {
+        if (StartOfRound.Instance == null || StartOfRound.Instance.allPlayerScripts == null)
+        {
+            return null;
+        }
+
+        PlayerControllerB? bestPlayer = null;
+        var bestDistance = float.MaxValue;
+        foreach (var player in StartOfRound.Instance.allPlayerScripts)
+        {
+            if (!IsValidTarget(player, requireVisible: true))
+            {
+                continue;
+            }
+
+            var distance = Vector3.Distance(transform.position, player.transform.position);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                bestPlayer = player;
+            }
+        }
+
+        return bestPlayer;
+    }
+
+    private bool IsValidTarget(PlayerControllerB? player, bool requireVisible)
+    {
+        if (player == null || !player.isPlayerControlled || player.isPlayerDead || !player.isInsideFactory || player.isInHangarShipRoom)
+        {
+            return false;
+        }
+
+        if (targetCooldownUntil.TryGetValue(player.playerClientId, out var cooldownEndsAt) && Time.time < cooldownEndsAt)
+        {
+            return false;
+        }
+
+        var distance = Vector3.Distance(transform.position, player.transform.position);
+        if (distance > LoseTargetDistance || (requireVisible && distance > VisionRange))
+        {
+            return false;
+        }
+
+        return !requireVisible || CanSeePlayer(player, distance);
+    }
+
+    private bool CanSeePlayer(PlayerControllerB player, float distance)
+    {
+        var eyePosition = transform.position + Vector3.up * 1.35f;
+        var targetPosition = player.transform.position + Vector3.up * 1.2f;
+        var toPlayer = targetPosition - eyePosition;
+        if (distance > 1f && Vector3.Dot(transform.forward, toPlayer.normalized) < VisionDotThreshold)
+        {
+            return false;
+        }
+
+        var mask = StartOfRound.Instance != null ? StartOfRound.Instance.collidersAndRoomMaskAndDefault : ~0;
+        return !Physics.Linecast(eyePosition, targetPosition, mask, QueryTriggerInteraction.Ignore);
+    }
+
+    private void WanderInsideFactory(bool forceDecision)
+    {
+        if (agent == null || (!forceDecision && Time.time < nextWanderRefreshAt && agent.hasPath && agent.remainingDistance > 1.5f))
+        {
+            return;
+        }
+
+        ConfigureAgentForMovement(WanderSpeed);
+        nextWanderRefreshAt = Time.time + WanderRefreshInterval;
+        var destination = ChooseWanderDestination();
+        if (destination.HasValue)
+        {
+            SetDestinationToPosition(destination.Value, true);
+        }
+    }
+
+    private Vector3? ChooseWanderDestination()
+    {
+        GetAINodes();
+        if (allAINodes == null || allAINodes.Length == 0)
+        {
+            return null;
+        }
+
+        for (var attempt = 0; attempt < 12; attempt++)
+        {
+            var node = allAINodes[UnityEngine.Random.Range(0, allAINodes.Length)];
+            if (node == null)
+            {
+                continue;
+            }
+
+            var destination = node.transform.position;
+            if (Vector3.Distance(transform.position, destination) < 3f)
+            {
+                continue;
+            }
+
+            return destination;
+        }
+
+        var closestNode = ChooseClosestNodeToPosition(transform.position);
+        return closestNode != null ? closestNode.position : null;
+    }
+
+    private void ConfigureAgentForMovement(float speed)
     {
         if (agent == null)
         {
             return;
         }
 
-        agent.speed = 0f;
-        agent.velocity = Vector3.zero;
-        agent.isStopped = true;
+        agent.speed = speed;
+        agent.angularSpeed = 360f;
+        agent.acceleration = 10f;
+        agent.stoppingDistance = currentPursuitTarget != null ? 1.7f : 0.5f;
+        agent.updatePosition = true;
+        agent.updateRotation = false;
+        agent.isStopped = false;
+    }
+
+    private void RotateTowardsMovement()
+    {
+        var movement = transform.position - lastPosition;
+        movement.y = 0f;
+        lastPosition = transform.position;
+        if (movement.sqrMagnitude < 0.0001f)
+        {
+            return;
+        }
+
+        var targetRotation = Quaternion.LookRotation(movement.normalized, Vector3.up);
+        transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.deltaTime * RotationSpeed);
     }
 }
 
