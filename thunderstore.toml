@@ -5,7 +5,7 @@ schemaVersion = "0.0.1"
 namespace = "Ctb_Eivissa"
 name = "PingoEnemy"
 versionNumber = "2.0.0"
-description = "A harmless stationary Lethal Company enemy that gets noisier over time, especially when watched or shared in the same room."
+description = "A slow indoor Lethal Company enemy that gets noisier over time, chases players, and explodes at maximum buildup."
 websiteUrl = "https://github.com/JLeonL/pingoLC"
 containsNsfwContent = false
 

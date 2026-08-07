@@ -46,6 +46,7 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
 
     private static bool spawnedAfterLanding;
     private float nextDebugSpawnAllowedAt;
+    private static bool debugSpawnKeyWasDown;
 
     private void Awake()
     {
@@ -72,6 +73,7 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
         if (enableDebugSpawnKey.Value && DebugSpawnKeyPressed() && Time.time >= nextDebugSpawnAllowedAt)
         {
             nextDebugSpawnAllowedAt = Time.time + 1f;
+            Log.LogInfo("Detected Pingo debug spawn hotkey F6.");
             SpawnPingoNearLocalPlayer("debug hotkey");
         }
 
@@ -131,13 +133,11 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
 
     private static bool DebugSpawnKeyPressed()
     {
-        if (Input.GetKeyDown(KeyCode.F6))
-        {
-            return true;
-        }
-
         var keyboard = Keyboard.current;
-        return keyboard?.f6Key.wasPressedThisFrame == true;
+        var isDown = Input.GetKey(KeyCode.F6) || keyboard?.f6Key.isPressed == true || keyboard?.f6Key.wasPressedThisFrame == true;
+        var pressedThisFrame = isDown && !debugSpawnKeyWasDown;
+        debugSpawnKeyWasDown = isDown;
+        return pressedThisFrame;
     }
 
     private static void LoadAssets()
@@ -316,14 +316,20 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
             return false;
         }
 
-        var spawnPosition = GetSafeSpawnPositionInFrontOfPlayer(player);
-        if (!ForceTestSpawnInFrontOfPlayer && NavMesh.SamplePosition(spawnPosition, out var hit, 8f, NavMesh.AllAreas))
+        if (!TryGetInteriorSpawnPosition(player, out var spawnPosition))
+        {
+            Log.LogWarning($"Cannot spawn Pingo for {reason}: no interior NavMesh spawn position was found.");
+            return false;
+        }
+
+        if (NavMesh.SamplePosition(spawnPosition, out var hit, 8f, NavMesh.AllAreas))
         {
             spawnPosition = hit.position;
         }
-        else if (!ForceTestSpawnInFrontOfPlayer)
+        else
         {
-            Log.LogWarning($"Could not find nearby NavMesh for Pingo debug spawn; using raw position {spawnPosition}.");
+            Log.LogWarning($"Cannot spawn Pingo for {reason}: chosen interior position has no nearby NavMesh ({spawnPosition}).");
+            return false;
         }
 
         var yRotation = player.transform.eulerAngles.y + 180f;
@@ -331,6 +337,44 @@ public sealed class PingoEnemyPlugin : BaseUnityPlugin
         RoundManager.Instance.SpawnEnemyGameObject(spawnPosition, yRotation, -1, RegisteredEnemyType);
         Log.LogInfo($"Spawned Pingo near local player for {reason}.");
         return true;
+    }
+
+    private static bool TryGetInteriorSpawnPosition(PlayerControllerB player, out Vector3 spawnPosition)
+    {
+        var roundManager = RoundManager.Instance;
+        if (roundManager?.insideAINodes != null && roundManager.insideAINodes.Length > 0)
+        {
+            var closestNode = roundManager.GetClosestNode(player.transform.position, false);
+            if (closestNode != null)
+            {
+                spawnPosition = closestNode.position;
+                Log.LogInfo($"Pingo interior test spawn selected closest indoor AI node: {spawnPosition}.");
+                return true;
+            }
+
+            for (var i = 0; i < roundManager.insideAINodes.Length; i++)
+            {
+                var node = roundManager.insideAINodes[i];
+                if (node == null)
+                {
+                    continue;
+                }
+
+                spawnPosition = node.transform.position;
+                Log.LogInfo($"Pingo interior test spawn selected fallback indoor AI node: {spawnPosition}.");
+                return true;
+            }
+        }
+
+        if (player.isInsideFactory)
+        {
+            spawnPosition = GetSafeSpawnPositionInFrontOfPlayer(player);
+            Log.LogInfo($"Pingo interior test spawn selected player-front position inside factory: {spawnPosition}.");
+            return true;
+        }
+
+        spawnPosition = Vector3.zero;
+        return false;
     }
 
     private static Vector3 GetSafeSpawnPositionInFrontOfPlayer(PlayerControllerB player)
@@ -466,6 +510,9 @@ public sealed class PingoEnemyAI : EnemyAI
     private const float VisionRange = 45f;
     private const float VisionDotThreshold = 0.15f;
     private const float LoseTargetDistance = 70f;
+    private const float ExplosionWarningSeconds = 1f;
+    private const float ExplosionKillRadius = 3f;
+    private const int ExplosionDamage = 200;
 
     private AudioSource? source;
     private float nextNoiseAt;
@@ -479,6 +526,23 @@ public sealed class PingoEnemyAI : EnemyAI
     private float nextChasePathRefreshAt;
     private float nextWanderRefreshAt;
     private Vector3 lastPosition;
+    private Transform? leftUpperArm;
+    private Transform? rightUpperArm;
+    private Transform? leftForearm;
+    private Transform? rightForearm;
+    private Transform? leftThigh;
+    private Transform? rightThigh;
+    private Transform? leftCalf;
+    private Transform? rightCalf;
+    private Transform? leftFoot;
+    private Transform? rightFoot;
+    private Transform? spine;
+    private Transform? head;
+    private readonly Dictionary<Transform, Quaternion> bindRotations = new();
+    private float walkCycle;
+    private float visualMovementSpeed;
+    private bool explosionCharging;
+    private float explosionAt;
 
     public override void Start()
     {
@@ -502,6 +566,8 @@ public sealed class PingoEnemyAI : EnemyAI
         ConfigureAgentForMovement(WanderSpeed);
         SetEnemyOutside(false);
         isOutside = false;
+        CacheLuigiBones();
+        ApplyProceduralPose(0f, 0f);
         EnsureVisibleFallbackBody();
         ApplyLuigiMaterials();
         PingoEnemyPlugin.Log.LogInfo($"PingoEnemyAI started at {transform.position}; hasAudio={PingoEnemyPlugin.PingoClip != null}; isOwner={IsOwner}.");
@@ -807,10 +873,19 @@ public sealed class PingoEnemyAI : EnemyAI
         base.Update();
         if (IsServer)
         {
-            UpdateServerMovement(forceDecision: false);
+            EnsureAgentOnInteriorNavMesh();
+            if (explosionCharging)
+            {
+                StopForExplosionWarning();
+            }
+            else
+            {
+                UpdateServerMovement(forceDecision: false);
+            }
         }
 
-        RotateTowardsMovement();
+        RotateTowardsAttentionOrMovement();
+        UpdateProceduralWalkAnimation();
 
         if (source == null || PingoEnemyPlugin.PingoClip == null)
         {
@@ -820,6 +895,16 @@ public sealed class PingoEnemyAI : EnemyAI
         if (source.clip == null)
         {
             source.clip = PingoEnemyPlugin.PingoClip;
+        }
+
+        if (explosionCharging)
+        {
+            if (Time.time >= explosionAt)
+            {
+                DetonatePingoExplosion();
+            }
+
+            return;
         }
 
         aliveForSeconds += Time.deltaTime;
@@ -859,14 +944,7 @@ public sealed class PingoEnemyAI : EnemyAI
         PlayPingoLocal(Mathf.Clamp01(1f - interval / BaseInterval), CalculateNearVolumeScale(), interval, nearPlayerSeconds);
         if (resetOverlapRampAfterPlay)
         {
-            if (IsServer)
-            {
-                FinishPursuitCycle();
-            }
-
-            accumulatedIntervalReduction = 0f;
-            minimumIntervalPlayCount = 0;
-            PingoEnemyPlugin.Log.LogInfo("Pingo overlap loop played 30 times at minimum interval; resetting interval ramp.");
+            StartExplosionWarning();
         }
     }
 
@@ -1084,6 +1162,90 @@ public sealed class PingoEnemyAI : EnemyAI
         nextWanderRefreshAt = Time.time;
     }
 
+    private void StartExplosionWarning()
+    {
+        if (explosionCharging)
+        {
+            return;
+        }
+
+        explosionCharging = true;
+        explosionAt = Time.time + ExplosionWarningSeconds;
+        if (IsServer)
+        {
+            StopForExplosionWarning();
+        }
+
+        PingoEnemyPlugin.Log.LogInfo($"Pingo reached maximum sound accumulation; exploding in {ExplosionWarningSeconds:0.0}s.");
+    }
+
+    private void StopForExplosionWarning()
+    {
+        if (agent == null)
+        {
+            return;
+        }
+
+        agent.ResetPath();
+        agent.velocity = Vector3.zero;
+        agent.isStopped = true;
+    }
+
+    private void DetonatePingoExplosion()
+    {
+        if (!explosionCharging)
+        {
+            return;
+        }
+
+        explosionCharging = false;
+        Landmine.SpawnExplosion(transform.position, true, ExplosionKillRadius, ExplosionKillRadius, ExplosionDamage, 0f, null, false);
+        if (IsServer)
+        {
+            DamagePlayersInExplosionRadius();
+            FinishPursuitCycle();
+        }
+
+        ResetSoundRampCycle();
+        ConfigureAgentForMovement(WanderSpeed);
+        PingoEnemyPlugin.Log.LogInfo($"Pingo exploded. killRadius={ExplosionKillRadius:0.0}; position={transform.position}.");
+    }
+
+    private void DamagePlayersInExplosionRadius()
+    {
+        if (StartOfRound.Instance == null || StartOfRound.Instance.allPlayerScripts == null)
+        {
+            return;
+        }
+
+        foreach (var player in StartOfRound.Instance.allPlayerScripts)
+        {
+            if (player == null || !player.isPlayerControlled || player.isPlayerDead)
+            {
+                continue;
+            }
+
+            var distance = Vector3.Distance(player.transform.position, transform.position);
+            if (distance > ExplosionKillRadius)
+            {
+                continue;
+            }
+
+            var force = (player.transform.position - transform.position).normalized * 20f + Vector3.up * 8f;
+            player.DamagePlayer(ExplosionDamage, true, true, CauseOfDeath.Blast, 0, false, force);
+            PingoEnemyPlugin.Log.LogInfo($"Pingo explosion damaged player {player.playerClientId}; distance={distance:0.00}.");
+        }
+    }
+
+    private void ResetSoundRampCycle()
+    {
+        aliveForSeconds = 0f;
+        nearPlayerSeconds = 0f;
+        accumulatedIntervalReduction = 0f;
+        minimumIntervalPlayCount = 0;
+        nextNoiseAt = Time.time + BaseInterval;
+    }
+
     private void ClearPursuitTarget(string reason)
     {
         if (currentPursuitTarget != null)
@@ -1175,6 +1337,22 @@ public sealed class PingoEnemyAI : EnemyAI
         }
     }
 
+    private void EnsureAgentOnInteriorNavMesh()
+    {
+        if (agent == null || agent.isOnNavMesh)
+        {
+            return;
+        }
+
+        var destination = ChooseWanderDestination();
+        if (destination.HasValue && NavMesh.SamplePosition(destination.Value, out var hit, 12f, NavMesh.AllAreas))
+        {
+            agent.Warp(hit.position);
+            transform.position = hit.position;
+            PingoEnemyPlugin.Log.LogInfo($"Warped Pingo onto interior NavMesh at {hit.position}.");
+        }
+    }
+
     private Vector3? ChooseWanderDestination()
     {
         GetAINodes();
@@ -1220,18 +1398,163 @@ public sealed class PingoEnemyAI : EnemyAI
         agent.isStopped = false;
     }
 
-    private void RotateTowardsMovement()
+    private void RotateTowardsAttentionOrMovement()
     {
         var movement = transform.position - lastPosition;
         movement.y = 0f;
         lastPosition = transform.position;
-        if (movement.sqrMagnitude < 0.0001f)
+        visualMovementSpeed = movement.magnitude / Mathf.Max(Time.deltaTime, 0.001f);
+
+        var lookDirection = GetAttentionDirection();
+        if (!lookDirection.HasValue && movement.sqrMagnitude > 0.0001f)
+        {
+            lookDirection = movement.normalized;
+        }
+
+        if (!lookDirection.HasValue)
         {
             return;
         }
 
-        var targetRotation = Quaternion.LookRotation(movement.normalized, Vector3.up);
-        transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.deltaTime * RotationSpeed);
+        var targetRotation = Quaternion.LookRotation(lookDirection.Value, Vector3.up);
+        transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.deltaTime * (RotationSpeed * 1.5f));
+    }
+
+    private Vector3? GetAttentionDirection()
+    {
+        var player = currentPursuitTarget;
+        if (player == null || player.isPlayerDead || !player.isPlayerControlled)
+        {
+            player = FindClosestPlayerForAttention();
+        }
+
+        if (player == null)
+        {
+            return null;
+        }
+
+        var direction = player.transform.position - transform.position;
+        direction.y = 0f;
+        return direction.sqrMagnitude > 0.01f ? direction.normalized : null;
+    }
+
+    private PlayerControllerB? FindClosestPlayerForAttention()
+    {
+        if (StartOfRound.Instance == null || StartOfRound.Instance.allPlayerScripts == null)
+        {
+            return null;
+        }
+
+        PlayerControllerB? closestPlayer = null;
+        var closestDistance = float.MaxValue;
+        foreach (var player in StartOfRound.Instance.allPlayerScripts)
+        {
+            if (player == null || !player.isPlayerControlled || player.isPlayerDead || !player.isInsideFactory)
+            {
+                continue;
+            }
+
+            var distance = Vector3.Distance(transform.position, player.transform.position);
+            if (distance > VisionRange || distance >= closestDistance)
+            {
+                continue;
+            }
+
+            closestDistance = distance;
+            closestPlayer = player;
+        }
+
+        return closestPlayer;
+    }
+
+    private void CacheLuigiBones()
+    {
+        bindRotations.Clear();
+        var transforms = GetComponentsInChildren<Transform>(true);
+        foreach (var child in transforms)
+        {
+            bindRotations[child] = child.localRotation;
+            switch (child.name)
+            {
+                case "L_upperarm":
+                    leftUpperArm = child;
+                    break;
+                case "R_upperarm":
+                    rightUpperArm = child;
+                    break;
+                case "L_forearm":
+                    leftForearm = child;
+                    break;
+                case "R_forearm":
+                    rightForearm = child;
+                    break;
+                case "L_thigh":
+                    leftThigh = child;
+                    break;
+                case "R_thigh":
+                    rightThigh = child;
+                    break;
+                case "L_calf":
+                    leftCalf = child;
+                    break;
+                case "R_calf":
+                    rightCalf = child;
+                    break;
+                case "L_foot":
+                    leftFoot = child;
+                    break;
+                case "R_foot":
+                    rightFoot = child;
+                    break;
+                case "spine00":
+                    spine = child;
+                    break;
+                case "head":
+                    head = child;
+                    break;
+            }
+        }
+
+        PingoEnemyPlugin.Log.LogInfo($"Cached Luigi bones for procedural animation. arms={leftUpperArm != null && rightUpperArm != null}; legs={leftThigh != null && rightThigh != null}.");
+    }
+
+    private void UpdateProceduralWalkAnimation()
+    {
+        if (bindRotations.Count == 0)
+        {
+            return;
+        }
+
+        var movingAmount = Mathf.Clamp01(visualMovementSpeed / WanderSpeed);
+        walkCycle += Time.deltaTime * Mathf.Lerp(1.5f, 7f, movingAmount);
+        ApplyProceduralPose(Mathf.Sin(walkCycle), movingAmount);
+    }
+
+    private void ApplyProceduralPose(float stride, float movingAmount)
+    {
+        var armSwing = stride * 18f * movingAmount;
+        SetBoneRotation(leftUpperArm, new Vector3(armSwing, -8f, -54f));
+        SetBoneRotation(rightUpperArm, new Vector3(-armSwing, 8f, -54f));
+        SetBoneRotation(leftForearm, new Vector3(0f, -4f, -8f));
+        SetBoneRotation(rightForearm, new Vector3(0f, 4f, -8f));
+        SetBoneRotation(leftThigh, new Vector3(stride * 28f * movingAmount, 0f, 0f));
+        SetBoneRotation(rightThigh, new Vector3(-stride * 28f * movingAmount, 0f, 0f));
+        SetBoneRotation(leftCalf, new Vector3(Mathf.Max(0f, -stride) * 22f * movingAmount, 0f, 0f));
+        SetBoneRotation(rightCalf, new Vector3(Mathf.Max(0f, stride) * 22f * movingAmount, 0f, 0f));
+        SetBoneRotation(leftFoot, new Vector3(-8f * movingAmount, 0f, 0f));
+        SetBoneRotation(rightFoot, new Vector3(-8f * movingAmount, 0f, 0f));
+        SetBoneRotation(spine, new Vector3(0f, stride * 2f * movingAmount, 0f));
+        SetBoneRotation(head, new Vector3(0f, -stride * 3f * movingAmount, 0f));
+    }
+
+    private void SetBoneRotation(Transform? bone, Vector3 eulerOffset)
+    {
+        if (bone == null || !bindRotations.TryGetValue(bone, out var bindRotation))
+        {
+            return;
+        }
+
+        bone.localRotation = bindRotation * Quaternion.Euler(eulerOffset);
     }
 }
 

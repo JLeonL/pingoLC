@@ -3,10 +3,11 @@
 ## 2.0.0
 
 - Adds movement for Pingo using the indoor NavMesh.
-- Pingo now patrols interior rooms, looks for visible players, and chases a selected target.
-- After the sound overlap loop resets, Pingo gives the chased player a 30 second cooldown before targeting them again.
-- Keeps Pingo as a harmless enemy and prevents it from acting as an outside enemy.
-- Adds NetworkTransform support so movement is synchronized for multiplayer clients.
+- Pingo patrols interior rooms, rotates toward nearby players, and chases visible targets.
+- Adds runtime procedural bone animation so the Luigi model walks instead of staying in T-pose.
+- At maximum sound buildup, Pingo stops for 1 second, explodes, and can kill players within 3m.
+- After the explosion cycle, Pingo gives the chased player a 30 second targeting cooldown before pursuing them again.
+- Keeps forced testing spawns inside the dungeon and adds NetworkTransform support for multiplayer movement.
 
 ## 1.0.2
 
